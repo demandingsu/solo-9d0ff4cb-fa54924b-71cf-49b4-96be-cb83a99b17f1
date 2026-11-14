@@ -1,0 +1,13 @@
+# Demo override: every job holds the paired-result publish step for
+# QC_SLOW_PUBLISH_SECONDS. The sleep is interruptible by stop, and status
+# queries / stop requests of all jobs stay responsive while it is held.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.slow-publish.yml up --build
+#
+# Or use the per-request hook instead: POST /jobs with form field
+# slow_publish_seconds=15 (no extra compose file needed).
+services:
+  qc-api:
+    environment:
+      QC_DATA_DIR: /data
+      QC_SLOW_PUBLISH_SECONDS: "15"

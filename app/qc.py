@@ -23,13 +23,17 @@ from __future__ import annotations
 
 import gzip
 import io
+import logging
 import os
 import sys
 import threading
+import time
 import zlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
+
+logger = logging.getLogger(__name__)
 
 # Phred+33 printable range.
 MIN_QUALITY_BYTE = 33
@@ -368,7 +372,115 @@ def run_qc(
                         raise
 
 
-def publish_outputs(part_r1: Path, part_r2: Path, final_r1: Path, final_r2: Path) -> None:
-    """Atomically move completed gzip outputs into their download names."""
-    os.replace(part_r1, final_r1)
-    os.replace(part_r2, final_r2)
+@dataclass(frozen=True)
+class PublishFaults:
+    """Deterministic fault injection for the paired-result publish step.
+
+    ``fail_r2`` makes the R2 publish raise after R1 has been moved into
+    place, exercising the rollback path.  ``slow_seconds`` stretches the
+    publish so responsiveness/stop behaviour can be observed.  The injected
+    slumber is interruptible by the job's stop event.
+    """
+
+    fail_r2: bool = False
+    slow_seconds: float = 0.0
+
+
+class PublishError(Exception):
+    """A result file could not be published; the job must fail cleanly."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.code = "publish_failed"
+        self.message = message
+
+
+def _interruptible_sleep(seconds: float, stop_event: threading.Event) -> None:
+    """Sleep *seconds* but return as soon as the stop event is observed."""
+    deadline = time.monotonic() + seconds
+    while True:
+        if stop_event.is_set():
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        stop_event.wait(timeout=min(0.05, remaining))
+
+
+def _rollback_publish(part_r1: Path, part_r2: Path, final_r1: Path, final_r2: Path) -> None:
+    """Undo a partially completed publish and remove all result artifacts.
+
+    Best effort: any file that has already reached its final name is moved
+    back to its ``.part`` name when possible, then every part/final path is
+    deleted so no half-published result can ever be downloaded.
+    """
+    for final, part in ((final_r1, part_r1), (final_r2, part_r2)):
+        try:
+            if final.is_file():
+                if part.exists():
+                    final.unlink()
+                else:
+                    final.replace(part)
+        except OSError:
+            logger.warning("could not roll back published file %s", final)
+    for path in (part_r1, part_r2, final_r1, final_r2):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:  # pragma: no cover - best effort
+            logger.warning("could not remove leftover result file %s", path)
+
+
+def publish_outputs(
+    part_r1: Path,
+    part_r2: Path,
+    final_r1: Path,
+    final_r2: Path,
+    stop_event: threading.Event,
+    *,
+    faults: PublishFaults | None = None,
+) -> None:
+    """Publish the paired gzip results atomically as a pair.
+
+    Both files are moved into their download names inside this call.  If the
+    R2 publish fails for any reason -- an injected fault or a real
+    ``OSError`` -- the already-published R1 file is rolled back and every
+    result/temporary file is removed, then :class:`PublishError` is raised so
+    the caller can settle the job into an explainable failed terminal state.
+
+    A stop request observed before either move, between the two moves, or
+    during the (interruptible) slow-publish window raises
+    :class:`JobStopped` after cleaning up; a job that was stopped can never
+    end up published.
+    """
+    faults = faults or PublishFaults()
+
+    if stop_event.is_set():
+        _rollback_publish(part_r1, part_r2, final_r1, final_r2)
+        raise JobStopped()
+    if faults.slow_seconds > 0:
+        _interruptible_sleep(faults.slow_seconds, stop_event)
+        if stop_event.is_set():
+            _rollback_publish(part_r1, part_r2, final_r1, final_r2)
+            raise JobStopped()
+
+    try:
+        os.replace(part_r1, final_r1)
+    except OSError as exc:
+        _rollback_publish(part_r1, part_r2, final_r1, final_r2)
+        raise PublishError(f"R1 result could not be published: {exc}") from exc
+
+    if stop_event.is_set():
+        _rollback_publish(part_r1, part_r2, final_r1, final_r2)
+        raise JobStopped()
+
+    if faults.fail_r2:
+        _rollback_publish(part_r1, part_r2, final_r1, final_r2)
+        raise PublishError(
+            "R2 result publish failed after R1 was staged; rolled R1 back"
+        )
+
+    try:
+        os.replace(part_r2, final_r2)
+    except OSError as exc:
+        _rollback_publish(part_r1, part_r2, final_r1, final_r2)
+        raise PublishError(f"R2 result could not be published: {exc}") from exc

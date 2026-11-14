@@ -39,3 +39,13 @@ JOB="$(submit "$ROOT/samples/truncated_R1.fastq.gz" "$ROOT/samples/truncated_R2.
 ID="$(python3 -c 'import json,sys;print(json.load(sys.stdin)["job_id"])' <<<"$JOB")"
 wait_job "$ID" | python3 -c "import json,sys;d=json.load(sys.stdin);print(d['status'],d['error'])"
 echo "# download status: $(curl -s -o /dev/null -w '%{http_code}' "$BASE/jobs/$ID/download/r1")"
+
+echo "# controlled R2 publish failure (expect failed publish_failed, pair rolled back, no download)"
+JOB="$(curl -sf -X POST "$BASE/jobs" \
+  -F "r1=@$ROOT/samples/good_R1.fastq.gz" \
+  -F "r2=@$ROOT/samples/good_R2.fastq.gz" \
+  -F "min_quality=20" -F "fail_r2_publish=true")"
+ID="$(python3 -c 'import json,sys;print(json.load(sys.stdin)["job_id"])' <<<"$JOB")"
+wait_job "$ID" | python3 -c "import json,sys;d=json.load(sys.stdin);print(d['status'],d['error'],'downloads=',d['downloads'])"
+echo "# r1/r2 download status: $(curl -s -o /dev/null -w '%{http_code}' "$BASE/jobs/$ID/download/r1") / $(curl -s -o /dev/null -w '%{http_code}' "$BASE/jobs/$ID/download/r2")"
+

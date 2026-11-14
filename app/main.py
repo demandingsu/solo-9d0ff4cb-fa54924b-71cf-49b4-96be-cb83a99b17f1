@@ -15,8 +15,9 @@ from .jobs import (
     JobConflict,
     JobManager,
     JobNotFound,
+    MAX_SLOW_PUBLISH_SECONDS,
 )
-from .qc import MAX_PHRED, MIN_PHRED
+from .qc import MAX_PHRED, MIN_PHRED, PublishFaults
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +94,49 @@ def _parse_threshold(
     return value
 
 
+def _parse_publish_faults(
+    fail_r2_publish: str | None, slow_publish_seconds: str | None
+) -> PublishFaults | None:
+    """Parse optional, demo-only publish fault-injection form fields.
+
+    Returns ``None`` when neither field was supplied so the manager's
+    process-wide defaults (env vars) apply.
+    """
+    fail_raw = (fail_r2_publish or "").strip()
+    slow_raw = (slow_publish_seconds or "").strip()
+    if not fail_raw and not slow_raw:
+        return None
+
+    fail_r2 = fail_raw.lower() in {"1", "true", "yes", "on"}
+    if fail_raw and fail_raw.lower() not in {"1", "true", "yes", "on", "0", "false", "no", "off"}:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "fail_r2_publish must be a boolean "
+                "(true/false, 1/0, yes/no, on/off)"
+            ),
+        )
+
+    slow_seconds = 0.0
+    if slow_raw:
+        try:
+            slow_seconds = float(slow_raw)
+        except ValueError:
+            raise HTTPException(
+                status_code=422,
+                detail=f"slow_publish_seconds {slow_raw!r} is not a number",
+            ) from None
+        if not (0.0 <= slow_seconds <= MAX_SLOW_PUBLISH_SECONDS):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "slow_publish_seconds must be between 0 and "
+                    f"{MAX_SLOW_PUBLISH_SECONDS:g}"
+                ),
+            )
+    return PublishFaults(fail_r2=fail_r2, slow_seconds=slow_seconds)
+
+
 def create_app(data_dir: Path | str | None = None) -> FastAPI:
     resolved_data_dir = Path(
         data_dir
@@ -155,15 +199,35 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
         ),
         quality_threshold: str | None = Form(None, include_in_schema=False),
         threshold: str | None = Form(None, include_in_schema=False),
+        fail_r2_publish: str | None = Form(
+            None,
+            description=(
+                "Demo/regression hook: force the R2 result publish to fail "
+                "after R1 is staged, exercising paired rollback. The job "
+                "ends 'failed' with code 'publish_failed' and no downloads."
+            ),
+        ),
+        slow_publish_seconds: str | None = Form(
+            None,
+            description=(
+                "Demo hook: hold the publish step for this many seconds "
+                "(interruptible by stop). Shows that queries/stops stay "
+                "responsive during a slow publish."
+            ),
+        ),
     ) -> dict:
         threshold_value = _parse_threshold(
             min_quality, quality_threshold, threshold
+        )
+        publish_faults = _parse_publish_faults(
+            fail_r2_publish, slow_publish_seconds
         )
         manager = _manager(request)
         job = manager.create_job(
             r1_filename=Path(r1.filename or "R1.fastq.gz").name,
             r2_filename=Path(r2.filename or "R2.fastq.gz").name,
             min_quality=threshold_value,
+            publish_faults=publish_faults,
         )
         try:
             size1 = await _save_upload(r1, job.input_r1, "R1")

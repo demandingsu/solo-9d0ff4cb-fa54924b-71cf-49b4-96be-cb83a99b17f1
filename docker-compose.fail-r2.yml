@@ -1,0 +1,13 @@
+# Demo override: every job fails when publishing the R2 result (R1 is staged
+# first, then rolled back). The job settles into a explainable 'failed'
+# terminal state with error code 'publish_failed' and no downloadable files.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.fail-r2.yml up --build
+#
+# Or use the per-request hook instead: POST /jobs with form field
+# fail_r2_publish=true (no extra compose file needed).
+services:
+  qc-api:
+    environment:
+      QC_DATA_DIR: /data
+      QC_FAIL_R2_PUBLISH: "true"

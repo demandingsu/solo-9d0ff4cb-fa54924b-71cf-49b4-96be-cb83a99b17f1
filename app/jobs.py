@@ -19,6 +19,7 @@ Concurrency contract
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 import threading
 import uuid
@@ -27,7 +28,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .qc import JobStopped, QCError, QCResult, publish_outputs, run_qc
+from .qc import (
+    JobStopped,
+    PublishError,
+    PublishFaults,
+    QCError,
+    QCResult,
+    publish_outputs,
+    run_qc,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -38,8 +47,29 @@ SUCCEEDED = "succeeded"
 FAILED = "failed"
 STOPPED = "stopped"
 
+# Worker sub-phases (surfaced only while a job is active).
+PHASE_PROCESSING = "processing"
+PHASE_PUBLISHING = "publishing"
+
 TERMINAL_STATUSES = frozenset({SUCCEEDED, FAILED, STOPPED})
 STOPPABLE_STATUSES = frozenset({PENDING, RUNNING})
+
+MAX_SLOW_PUBLISH_SECONDS = 300.0
+
+
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_float(name: str) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return 0.0
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        logger.warning("ignoring invalid %s=%r", name, raw)
+        return 0.0
 
 
 class JobNotFound(Exception):
@@ -63,7 +93,9 @@ class Job:
     r1_filename: str
     r2_filename: str
     min_quality: int
+    publish_faults: PublishFaults = field(default_factory=PublishFaults)
     status: str = PENDING
+    phase: str | None = None
     created_at: str = field(default_factory=_now)
     started_at: str | None = None
     finished_at: str | None = None
@@ -109,6 +141,7 @@ class Job:
         result: dict[str, Any] = {
             "job_id": self.job_id,
             "status": self.status,
+            "phase": self.phase if self.status not in TERMINAL_STATUSES else None,
             "min_quality": self.min_quality,
             "r1_filename": self.r1_filename,
             "r2_filename": self.r2_filename,
@@ -141,6 +174,11 @@ class JobManager:
         self.jobs_dir.mkdir(parents=True, exist_ok=True)
         self._jobs: dict[str, Job] = {}
         self._lock = threading.Lock()
+        # Process-wide publish fault defaults (overridable per job).
+        self._default_faults = PublishFaults(
+            fail_r2=_env_flag("QC_FAIL_R2_PUBLISH"),
+            slow_seconds=min(_env_float("QC_SLOW_PUBLISH_SECONDS"), MAX_SLOW_PUBLISH_SECONDS),
+        )
         self._remove_stale_directories()
 
     # -- lifecycle -------------------------------------------------------
@@ -160,7 +198,11 @@ class JobManager:
                 logger.warning("could not remove stale path %s", child)
 
     def create_job(
-        self, r1_filename: str, r2_filename: str, min_quality: int
+        self,
+        r1_filename: str,
+        r2_filename: str,
+        min_quality: int,
+        publish_faults: PublishFaults | None = None,
     ) -> Job:
         job_id = uuid.uuid4().hex
         directory = self.jobs_dir / job_id
@@ -171,6 +213,7 @@ class JobManager:
             r1_filename=r1_filename,
             r2_filename=r2_filename,
             min_quality=min_quality,
+            publish_faults=publish_faults or self._default_faults,
         )
         with self._lock:
             self._jobs[job_id] = job
@@ -269,6 +312,7 @@ class JobManager:
                 stop_early = True
             elif job.status == PENDING:
                 job.status = RUNNING
+                job.phase = PHASE_PROCESSING
                 job.started_at = _now()
                 stop_early = False
             else:  # pragma: no cover - upload aborted / defensive
@@ -303,25 +347,64 @@ class JobManager:
                 job.pairs_processed = pairs
 
     def _finish_completed(self, job: Job, result: QCResult) -> None:
+        # Publish *outside* the job lock: a slow publish must not block
+        # status queries or stop requests for this or any other job.  The
+        # publish itself is stop-aware and rolls back on any failure.
         with self._lock:
             if job.status == STOPPING or job.stop_event.is_set():
-                # A stop was accepted while the worker was finishing.
+                self._finish_stopped(job)
+                return
+            job.phase = PHASE_PUBLISHING
+
+        try:
+            publish_outputs(
+                job.part_r1,
+                job.part_r2,
+                job.output_r1,
+                job.output_r2,
+                job.stop_event,
+                faults=job.publish_faults,
+            )
+        except JobStopped:
+            # Stop accepted while publishing.  The publish action has now
+            # exited and cleaned up; only then may we report "stopped".
+            self._finish_stopped(job)
+            return
+        except PublishError as exc:
+            # One end could not be published.  publish_outputs already
+            # removed every staged/temporary result, so settle the job into
+            # an explainable failed terminal state (unless a stop raced and
+            # won, in which case the stop contract takes precedence).
+            with self._lock:
+                stop_won = job.status == STOPPING or job.stop_event.is_set()
+            if stop_won:
+                self._finish_stopped(job)
+            else:
+                self._finish_failed(job, exc.code, exc.message)
+            return
+        except Exception as exc:  # pragma: no cover - defensive safety net
+            logger.exception("unexpected publish error in job %s", job.job_id)
+            with self._lock:
+                stop_won = job.status == STOPPING or job.stop_event.is_set()
+            if stop_won:
+                self._finish_stopped(job)
+            else:
+                self._finish_failed(job, "publish_failed", str(exc))
+            return
+
+        # Both files are on disk.  Re-check the stop flag under the lock and
+        # only then commit "succeeded": an accepted stop can never flip back
+        # to success, and once "succeeded" is visible the pair is complete.
+        with self._lock:
+            if job.status == STOPPING or job.stop_event.is_set():
                 stop_wins = True
             else:
                 stop_wins = False
-                # Publish only under the same lock used by stop requests and
-                # download lookups: once ``succeeded`` is visible the files
-                # are already in place, and a later stop is rejected.
-                publish_outputs(
-                    job.part_r1,
-                    job.part_r2,
-                    job.output_r1,
-                    job.output_r2,
-                )
                 job.total_pairs = result.total_pairs
                 job.kept_pairs = result.kept_pairs
                 job.discarded_pairs = result.discarded_pairs
                 job.pairs_processed = result.total_pairs
+                job.phase = None
                 job.finished_at = _now()
                 job.status = SUCCEEDED
         if stop_wins:
@@ -336,6 +419,7 @@ class JobManager:
             else:
                 stop_wins = False
                 job.status = FAILED
+                job.phase = None
                 job.error_code = code
                 job.error_message = message
                 job.finished_at = _now()
@@ -345,10 +429,12 @@ class JobManager:
         self._cleanup_all(job)
 
     def _finish_stopped(self, job: Job) -> None:
-        # Temporary inputs and partial outputs are removed *before* the job is
-        # reported as stopped, as required by the stop contract.
+        # Temporary inputs, partial outputs and any staged results are
+        # removed *before* the job is reported as stopped, as required by
+        # the stop contract.  The publish action has already exited by now.
         self._cleanup_all(job)
         with self._lock:
+            job.phase = None
             job.total_pairs = None
             job.kept_pairs = None
             job.discarded_pairs = None
